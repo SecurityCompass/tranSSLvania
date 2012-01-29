@@ -3,6 +3,44 @@ require 'openssl'
 require 'logger'
 require 'uri'
 
+class FakeSSLContext < OpenSSL::SSL::SSLContext
+  @@cert_cache = Hash.new
+  def initialize(subject)
+   #we'll cache certs we've seen before
+    if  @@cert_cache.key? subject
+      @@cert_cache[subject]
+    else
+      #we use a previously generated root ca
+      root_key = OpenSSL::PKey::RSA.new File.open("root.key")
+      root_ca = OpenSSL::X509::Certificate.new File.open("root.pem")
+
+      #generate the forged cert
+      key = OpenSSL::PKey::RSA.new 2048
+      cert = OpenSSL::X509::Certificate.new
+      cert.version = 2
+      cert.serial = Random.rand(1000)
+      cert.subject = subject
+      cert.issuer = root_ca.subject # root CA is the issuer
+      cert.public_key = key.public_key
+      cert.not_before = Time.now
+      cert.not_after = cert.not_before + 1 * 365 * 24 * 60 * 60 # 1 years validity
+      ef = OpenSSL::X509::ExtensionFactory.new cert, root_ca
+      ef.create_ext("keyUsage","digitalSignature", true)
+      ef.create_ext("subjectKeyIdentifier","hash",false)
+      ef.create_ext("basicConstraints","CA:FALSE",false)
+      cert.sign(root_key, OpenSSL::Digest::SHA256.new)
+
+      super()
+      self.key = key    
+      self.cert = cert
+      self.ca_file="root.pem"
+      @@cert_cache[subject]=self
+      
+      self
+    end
+  end
+end
+
 class SSLProxy
   attr_accessor :invisible, :upstream_host, :upstream_port
   def initialize(port, opt = {}) 
@@ -78,12 +116,12 @@ class SSLProxy
         server = self.connect_ssl host, port
         cert = server.peer_cert
       end
-      ctx = self.forge_ssl_ctx cert.subject
+      ctx = FakeSSLContext.new cert.subject
       client.write "HTTP/1.0 200 Connection established\r\n\r\n"
       #initiate handshake
       ssl_client = OpenSSL::SSL::SSLSocket.new(client, ctx)
       ssl_client.accept
-      self.create_pipe ssl_client, server, self.get_request(ssl_client)
+      self.create_pipe ssl_client, server
     else
       uri = URI(addr)
       host = uri.host
@@ -106,72 +144,36 @@ class SSLProxy
         server.write initial_request
         $LOG.info("Client: #{initial_request}")
       end
-      while not (server.closed? or client.closed?)
-        data = ""
+      Thread.new(client, server) { |client, server| # server => client
         while not (client.closed? or server.eof?)
-          data << server.readpartial(1024)
-          puts data
+          data = server.readpartial(1024)
+          $LOG.info("Server: #{data}")
+          client.write data
         end
-        puts data
-        $LOG.info("Server: #{data}")
-        client.write data
-        if not server.closed?
-          if not client.closed?
-            request = self.get_request client
-            $LOG.info("Client: #{request}")
-            server.write request
-          else #client closed 
-            server.close
-          end
-        else #server closed
-          client.close
-        end
+      }
+      # client => server
+      while not (server.closed? and client.closed?)
+        request = self.get_request client
+        $LOG.info("Client: #{request}")
+        server.write request
+      end
+      if not client.closed?
         client.close
+      end
+      if not server.closed?
         server.close
       end
     rescue
-      client.close
-      server.close
-      $LOG.error("Error: #{$!} Data: #{data}") 
+      if not client.closed?
+        client.close
       end
-  end
-  
-  def forge_ssl_ctx(subject)
-    #we'll cache certs we've seen before
-    if  @cert_cache.key? subject
-      @cert_cache[subject]
-    else
-      #we use a previously generated root ca
-      root_key = OpenSSL::PKey::RSA.new File.open("root.key")
-      root_ca = OpenSSL::X509::Certificate.new File.open("root.pem")
-
-      #generate the forged cert
-      key = OpenSSL::PKey::RSA.new 2048
-      cert = OpenSSL::X509::Certificate.new
-      cert.version = 2
-      cert.serial = Random.rand(1000)
-      cert.subject = subject
-      cert.issuer = root_ca.subject # root CA is the issuer
-      cert.public_key = key.public_key
-      cert.not_before = Time.now
-      cert.not_after = cert.not_before + 1 * 365 * 24 * 60 * 60 # 1 years validity
-      ef = OpenSSL::X509::ExtensionFactory.new cert, root_ca
-      ef.create_ext("keyUsage","digitalSignature", true)
-      ef.create_ext("subjectKeyIdentifier","hash",false)
-      ef.create_ext("basicConstraints","CA:FALSE",false)
-      cert.sign(root_key, OpenSSL::Digest::SHA256.new)
-
-      ctx = OpenSSL::SSL::SSLContext.new
-      ctx.key = key    
-      ctx.cert = cert
-      ctx.ca_file="root.pem"
-
-      @cert_cache[subject]=ctx
-      ctx
+      if not server.closed?
+        server.close
+      end
+      $LOG.error("Error: #{$!} Data: #{data}") 
     end
   end
 end
-
 
 $LOG = Logger.new($stdout)
 $LOG.sev_threshold = Logger::ERROR
