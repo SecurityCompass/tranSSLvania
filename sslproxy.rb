@@ -166,7 +166,7 @@ end
 
 $LOG = Logger.new($stdout)
 $LOG.sev_threshold = Logger::ERROR
-#s = SSLProxy.new(8008, :upsteam_host => "localhost", :upstream_port => 8080)
+s = SSLProxy.new(8008, :upsteam_host => "localhost", :upstream_port => 8080)
 s = SSLProxy.new(8008)
 
 s.start
