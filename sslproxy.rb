@@ -3,17 +3,18 @@ require 'openssl'
 require 'logger'
 require 'uri'
 
-class FakeSSLContext < OpenSSL::SSL::SSLContext
-  @@cert_cache = Hash.new
-  def initialize(subject)
-   #we'll cache certs we've seen before
-    if  @@cert_cache.key? subject
-      @@cert_cache[subject]
-    else
+class SSLProxy
+  def initialize(port, opt = {}) 
+    @proxy = TCPServer.new(port)
+    @invisible = opt[:invisible] || false
+    @upstream_host = opt[:upstream_host] || nil
+    @upstream_port = opt[:upstream_port] || nil
+    # use this to cache forged ssl certs (SSLContexts)
+    @ssl_contexts = Hash.new { |ssl_contexts, subject|
       #we use a previously generated root ca
       root_key = OpenSSL::PKey::RSA.new File.open("root.key")
       root_ca = OpenSSL::X509::Certificate.new File.open("root.pem")
-
+      
       #generate the forged cert
       key = OpenSSL::PKey::RSA.new 2048
       cert = OpenSSL::X509::Certificate.new
@@ -29,26 +30,14 @@ class FakeSSLContext < OpenSSL::SSL::SSLContext
       ef.create_ext("subjectKeyIdentifier","hash",false)
       ef.create_ext("basicConstraints","CA:FALSE",false)
       cert.sign(root_key, OpenSSL::Digest::SHA256.new)
-
-      super()
-      self.key = key    
-      self.cert = cert
-      self.ca_file="root.pem"
-      @@cert_cache[subject]=self
       
-      self
-    end
-  end
-end
-
-class SSLProxy
-  attr_accessor :invisible, :upstream_host, :upstream_port
-  def initialize(port, opt = {}) 
-    @proxy = TCPServer.new(port)
-    @invisible = opt[:invisible] || false
-    @upstream_host = opt[:upstream_host] || nil
-    @upstream_port = opt[:upstream_port] || nil    
-    @cert_cache = Hash.new
+      ctx = OpenSSL::SSL::SSLContext.new
+      ctx.key = key
+      ctx.cert = cert
+      ctx.ca_file="root.pem"
+      ssl_contexts[subject] = ctx
+    }
+    
   end
 
   def upstream_proxy?
@@ -116,7 +105,7 @@ class SSLProxy
         server = self.connect_ssl host, port
         cert = server.peer_cert
       end
-      ctx = FakeSSLContext.new cert.subject
+      ctx = @ssl_contexts[cert.subject]
       client.write "HTTP/1.0 200 Connection established\r\n\r\n"
       #initiate handshake
       ssl_client = OpenSSL::SSL::SSLSocket.new(client, ctx)
@@ -170,7 +159,7 @@ class SSLProxy
       if not server.closed?
         server.close
       end
-      $LOG.error("Error: #{$!} Data: #{data}") 
+      $LOG.error("Error: #{$!}")
     end
   end
 end
