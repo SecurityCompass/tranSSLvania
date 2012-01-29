@@ -9,8 +9,7 @@ class SSLProxy
     @proxy = TCPServer.new(port)
     @invisible = opt[:invisible] || false
     @upstream_host = opt[:upstream_host] || nil
-    @upstream_port = opt[:upstream_port] || nil
-    
+    @upstream_port = opt[:upstream_port] || nil    
     @cert_cache = Hash.new
   end
 
@@ -26,6 +25,7 @@ class SSLProxy
       Thread.new(client) { |client|
         begin
           self.handle_visible_proxy client
+          client.close
         rescue
           $LOG.error($!)
         end
@@ -33,29 +33,34 @@ class SSLProxy
     end
   end
 
-  def connect_ssl host, port
+  def get_request(client)
+    request = ""
+      while l = client.gets and l != "\r\n"
+        request << l
+      end
+    request << "\r\n"
+  end
+
+  def connect_ssl(host, port)
     socket = TCPSocket.new(host,port)
     ssl = OpenSSL::SSL::SSLSocket.new(socket)
     ssl.sync_close = true
     ssl.connect
   end
 
-  def grab_cert host, port
+  def grab_cert(host, port)
     c = self.connect_ssl host, port
     c.peer_cert
   end
   
-  def handle_visible_proxy client
+  def handle_visible_proxy(client)
     #this is the visible proxy mode, the client will send us an
     #unencrypted CONNECT request before we begin the SSL handshake
     #we ascertain the host/port from there
-    request = []
-    while l = client.gets and l != "\r\n"
-      request.push l
-    end
+    request = get_request client
     #if the first line is  "CONNECT host:port HTTP/1.1\r\n" we're in
     #ssl MitM mode, otherwise, pass this along untouched.
-    method, addr, protocol = request[0].split
+    method, addr, protocol = request.split('\n')[0].split
     if method == "CONNECT"
       host, port = addr.split ':'
       if port.nil?
@@ -75,66 +80,63 @@ class SSLProxy
       end
       ctx = self.forge_ssl_ctx cert.subject
       client.write "HTTP/1.0 200 Connection established\r\n\r\n"
-      
       #initiate handshake
       ssl_client = OpenSSL::SSL::SSLSocket.new(client, ctx)
       ssl_client.accept
-
-      self.create_pipe ssl_client, server
+      self.create_pipe ssl_client, server, self.get_request(ssl_client)
     else
       uri = URI(addr)
       host = uri.host
       port = uri.port
-      puts host,port
       #we're just passing through unencrypted data
       if self.upstream_proxy?
         server = TCPSocket.new(@upstream_host, @upstream_port)
       else
         server = TCPSocket.new(host, port)
       end
-      request.each { |l|
-        server.write l
-      }
-      server.write "\r\n"
-      self.create_pipe client, server
+      #we pass along the request we cached
+      self.create_pipe client, server, request
     end
   end
 
 
-  def create_pipe client, server
-    Thread.new(client, server) { |client, server| #client => server
-      begin
-        while data = client.readpartial(100) 
-          if data.empty?
-            break
+  def create_pipe(client, server, initial_request = nil)
+    begin
+      if initial_request
+        server.write initial_request
+        $LOG.info("Client: #{initial_request}")
+      end
+      while not (server.closed? or client.closed?)
+        data = ""
+        while not (client.closed? or server.eof?)
+          data << server.readpartial(1024)
+          puts data
+        end
+        puts data
+        $LOG.info("Server: #{data}")
+        client.write data
+        if not server.closed?
+          if not client.closed?
+            request = self.get_request client
+            $LOG.info("Client: #{request}")
+            server.write request
+          else #client closed 
+            server.close
           end
-          $LOG.info("Client: #{data}")
-          server.write data
+        else #server closed
+          client.close
         end
         client.close
         server.close
-      rescue
-        $LOG.error("Error: #{$!} Data: #{data}")
       end
-    }
-    Thread.new(client, server) { |client, server| #server => client
-      begin
-        while data = server.readpartial(100)
-          if data.empty?
-            break
-          end
-          $LOG.info("Server: #{data}")
-          client.write data
-        end
-        client.close
-        server.close
-      rescue
-         $LOG.error("Error: #{$!} Data: #{data}") 
+    rescue
+      client.close
+      server.close
+      $LOG.error("Error: #{$!} Data: #{data}") 
       end
-    } 
   end
   
-  def forge_ssl_ctx subject
+  def forge_ssl_ctx(subject)
     #we'll cache certs we've seen before
     if  @cert_cache.key? subject
       @cert_cache[subject]
@@ -173,8 +175,8 @@ end
 
 $LOG = Logger.new($stdout)
 $LOG.sev_threshold = Logger::ERROR
-s = SSLProxy.new(8008, :upsteam_host => "localhost", :upstream_port => 8080)
-s.upstream_host = "localhost"
-s.upstream_port = 8080
+#s = SSLProxy.new(8008, :upsteam_host => "localhost", :upstream_port => 8080)
+s = SSLProxy.new(8008)
+
 s.start
 
