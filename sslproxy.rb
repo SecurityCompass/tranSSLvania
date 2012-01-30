@@ -4,6 +4,36 @@ require 'logger'
 require 'uri'
 require 'optparse'
 
+class Request # grabs an HTTP request from the socket
+  attr_accessor :contents, :method, :host, :port
+  def initialize(client)
+    @contents = ""
+    while l = client.readpartial(4096) and not l.end_with? "\r\n"
+      @contents << l
+    end
+    @contents << l
+    @method, addr, protocol = contents.split('\n')[0].split
+    if self.is_connect? #addr is host:port
+      @host, @port = addr.split ':'
+      if @port.nil?
+        @port = 443
+      else
+        @port = @port.to_i
+      end
+    else #addr is a uri
+      uri = URI(addr)
+      @host = uri.host
+      @port = uri.port
+      if @port.nil?
+        @port = 80
+      end
+    end
+  end
+  def is_connect?
+    @method == "CONNECT"
+  end
+end
+
 
 class SSLProxy
   def initialize(port, opt = {}) 
@@ -53,9 +83,8 @@ class SSLProxy
       client = @proxy.accept
       Thread.new(client) { |client|
         begin
-          self.handle_visible_proxy client
-          #client.close
-          #server.close
+          request = Request.new client
+          self.request_handler client, request
         rescue
           $LOG.error($!)
         end
@@ -63,14 +92,7 @@ class SSLProxy
     end
   end
 
-  def get_request(client)
-    request = ""
-    puts "IN GET REQUEST"
-    while l = client.gets and l != "\r\n" #and not l.empty?
-      request << l
-    end
-    request << "\r\n"
-  end
+  
 
   def connect_ssl(host, port)
     socket = TCPSocket.new(host,port)
@@ -84,29 +106,18 @@ class SSLProxy
     c.peer_cert
   end
   
-  def handle_visible_proxy(client)
-    #this is the visible proxy mode, the client will send us an
+  def request_handler(client, request)
+    #if his is the visible proxy mode, the client will send us an
     #unencrypted CONNECT request before we begin the SSL handshake
     #we ascertain the host/port from there
-    request = get_request client
-    #if the first line is  "CONNECT host:port HTTP/1.1\r\n" we're in
-    #ssl MitM mode, otherwise, pass this along untouched.
-    method, addr, protocol = request.split('\n')[0].split
-    if method == "CONNECT"
-      host, port = addr.split ':'
-      if port.nil?
-        port = 443
-      else
-        port = port.to_i
-      end
-
+    if request.is_connect?
       #connect to the server and forge the correct cert (using the same
       #subject as the server we connected to)
       if self.upstream_proxy?
-        cert = self.grab_cert host, port
+        cert = self.grab_cert request.host, request.port
         server = self.connect_ssl @upstream_host, @upstream_port
       else
-        server = self.connect_ssl host, port
+        server = self.connect_ssl request.host, request.port
         cert = server.peer_cert
       end
       ctx = @ssl_contexts[cert.subject]
@@ -114,17 +125,15 @@ class SSLProxy
       #initiate handshake
       ssl_client = OpenSSL::SSL::SSLSocket.new(client, ctx)
       ssl_client.accept
-      self.create_pipe ssl_client, server
+      self.create_pipe ssl_client, server, initial_request
     else
-      puts "ADDR", addr
-      uri = URI(addr)
-      host = uri.host
-      port = uri.port
       #we're just passing through unencrypted data
       if self.upstream_proxy?
         server = TCPSocket.new(@upstream_host, @upstream_port)
       else
-        server = TCPSocket.new(host, port)
+        server = TCPSocket.new(request.host, request.port)
+        server.write request.contents
+        server.write "\r\n"
       end
       #we pass along the request we cached
       self.create_pipe client, server, request
@@ -132,42 +141,62 @@ class SSLProxy
   end
 
 
-  def create_pipe(client, server, initial_request = nil)
+  def create_pipe(client, server, initial_request)
     begin
       if initial_request
-        server.write initial_request
-        $LOG.info("Client: #{initial_request}")
+        server.write initial_request.contents
+        $LOG.info("#{Thread.current}: client->server (initial) #{initial_request.inspect}")
       end
-      Thread.new(client, server) { |client, server| # server => client
-        until client.closed? or server.eof?
-          puts "READING FROM SERVER"
-          data = server.readpartial(1024)
-          $LOG.info("Server: #{data}")
-          client.write data
-          
+      while true
+        # Wait for data to be available on either socket.
+        (ready_sockets, dummy, dummy) = IO.select([client, server])
+        begin
+          ready_sockets.each do |socket|
+            if socket == client #and not socket.eof?
+              # Read from client, write to server.
+              request = Request.new client
+              # we may get requests for another domain coming down
+              # this pipe if we are a visible proxy 
+              # if wer're not proxied, we restart the handler
+              unless @invisible or self.upstream_proxy?
+                if request.host != initial_request.host or request.port != initial_request.port
+                  #we can also close the connection here??
+                  #server.close
+                  #client.close
+                  self.request_handler client, request
+                  break
+                end
+              end
+              $LOG.info("#{Thread.current}: client->server #{request.inspect}")
+              server.write request.contents
+              server.flush
+            else
+              # Read from server, write to client.
+              data = socket.readpartial(4096)
+              $LOG.info("#{Thread.current}: server->client #{data.inspect}")
+              client.write data
+              client.flush
+            end
+          end
+        rescue EOFError
+          $LOG.debug($!)
+          break
+        rescue IOError
+          $LOG.debug($!)
+          break
         end
-      }
-      until server.closed? or client.eof?
-        puts "FOOF"
-        request = self.get_request client
-        $LOG.info("Client: #{request}")
-        server.write request
-        puts server.closed?
       end
-      puts "EXIT UNTIL"
-      if not client.closed?
-        client.close
-      end
-      if not server.closed?
-        server.close
-      end
-    rescue
       unless client.closed?
         client.close
       end
       unless server.closed?
         server.close
       end
+    rescue EOFError
+      $LOG.debug($!)
+    rescue IOError
+      $LOG.debug($!)
+    rescue
       $LOG.error("Error: #{$!}")
     end
   end
@@ -184,10 +213,9 @@ OptionParser.new do |opts|
     $LOG.sev_threshold = Logger::DEBUG
   end
   opts.on("-P", "--upstream_proxy HOST:PORT", "Use an upstream proxy (host:port)") do |proxy|
-    puts proxy
     host, port = proxy.split(':')
     if host.nil? or port.nil?
-      puts "proxy must be in the form host:port"
+      $stderr.puts "proxy must be in the form host:port"
       exit
     end
     options[:upstream_host] = host
@@ -197,6 +225,5 @@ end.parse!
 
 
 s = SSLProxy.new(8008, options)
-
 s.start
 
