@@ -2,6 +2,8 @@ require 'socket'
 require 'openssl'
 require 'logger'
 require 'uri'
+require 'optparse'
+
 
 class SSLProxy
   def initialize(port, opt = {}) 
@@ -30,20 +32,20 @@ class SSLProxy
       ef.create_ext("subjectKeyIdentifier","hash",false)
       ef.create_ext("basicConstraints","CA:FALSE",false)
       cert.sign(root_key, OpenSSL::Digest::SHA256.new)
-      
+
+      #fill out the context
       ctx = OpenSSL::SSL::SSLContext.new
       ctx.key = key
       ctx.cert = cert
       ctx.ca_file="root.pem"
       ssl_contexts[subject] = ctx
     }
-    
   end
 
   def upstream_proxy?
     #are we forwarding traffic to an upstream proxy (vs. directly to
     #host)
-    not (upstream_host.nil? or upstream_port.nil?)
+    not (@upstream_host.nil? or @upstream_port.nil?)
   end
 
   def start
@@ -52,7 +54,8 @@ class SSLProxy
       Thread.new(client) { |client|
         begin
           self.handle_visible_proxy client
-          client.close
+          #client.close
+          #server.close
         rescue
           $LOG.error($!)
         end
@@ -62,9 +65,10 @@ class SSLProxy
 
   def get_request(client)
     request = ""
-      while l = client.gets and l != "\r\n"
-        request << l
-      end
+    puts "IN GET REQUEST"
+    while l = client.gets and l != "\r\n" #and not l.empty?
+      request << l
+    end
     request << "\r\n"
   end
 
@@ -112,6 +116,7 @@ class SSLProxy
       ssl_client.accept
       self.create_pipe ssl_client, server
     else
+      puts "ADDR", addr
       uri = URI(addr)
       host = uri.host
       port = uri.port
@@ -134,18 +139,22 @@ class SSLProxy
         $LOG.info("Client: #{initial_request}")
       end
       Thread.new(client, server) { |client, server| # server => client
-        while not (client.closed? or server.eof?)
+        until client.closed? or server.eof?
+          puts "READING FROM SERVER"
           data = server.readpartial(1024)
           $LOG.info("Server: #{data}")
           client.write data
+          
         end
       }
-      # client => server
-      while not (server.closed? and client.closed?)
+      until server.closed? or client.eof?
+        puts "FOOF"
         request = self.get_request client
         $LOG.info("Client: #{request}")
         server.write request
+        puts server.closed?
       end
+      puts "EXIT UNTIL"
       if not client.closed?
         client.close
       end
@@ -153,10 +162,10 @@ class SSLProxy
         server.close
       end
     rescue
-      if not client.closed?
+      unless client.closed?
         client.close
       end
-      if not server.closed?
+      unless server.closed?
         server.close
       end
       $LOG.error("Error: #{$!}")
@@ -166,8 +175,28 @@ end
 
 $LOG = Logger.new($stdout)
 $LOG.sev_threshold = Logger::ERROR
-s = SSLProxy.new(8008, :upsteam_host => "localhost", :upstream_port => 8080)
-s = SSLProxy.new(8008)
+
+options = {}
+OptionParser.new do |opts|
+  opts.banner = "Usage: example.rb [options]"
+
+  opts.on("-d", "--debug", "Enable debug output") do 
+    $LOG.sev_threshold = Logger::DEBUG
+  end
+  opts.on("-P", "--upstream_proxy HOST:PORT", "Use an upstream proxy (host:port)") do |proxy|
+    puts proxy
+    host, port = proxy.split(':')
+    if host.nil? or port.nil?
+      puts "proxy must be in the form host:port"
+      exit
+    end
+    options[:upstream_host] = host
+    options[:upstream_port] = port
+  end
+end.parse!
+
+
+s = SSLProxy.new(8008, options)
 
 s.start
 
