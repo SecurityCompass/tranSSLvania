@@ -76,7 +76,7 @@ class SSLProxy
       ctx.ca_file="root.pem"
       ssl_contexts[subject] = ctx
     }
-puts @host, @port
+    puts @host, @port
     @proxy = TCPServer.new(@host, @port)
   end
 
@@ -92,30 +92,29 @@ puts @host, @port
       client = @proxy.accept
       Thread.new(client) { |client|
 	begin
-	#we grab the 1st two bytes to see if they contain the magic number
-      	#for SSL ClientHello, and create an SSL socket accordingly
-      	if @invisible
-puts "INVVV"
-	bytes = client.recv(2, Socket::MSG_PEEK)  
-      	if $CLIENT_HELLOS.include? bytes
-	  $LOG.debug("First bytes #{bytes}, SSL ClientHello")
-          dummy, port, host = client.getsockopt(Socket::SOL_IP, $SO_ORIGINAL_DST).unpack("nnN")
-	  cert = self.get_cert(host, port)
-	  ctx = @ssl_contexts[cert.subject]
-	  ssl_client = OpenSSL::SSL::SSLSocket.new(client,ctx)
-	  ssl_client.accept
-          request = Request.new ssl_client, true
-          self.request_handler_ssl ssl_client, request
-        else
-          $LOG.debug("First bytes #{bytes}, HTTP")
-          request = Request.new client
-          self.request_handler client, request
-        end
-	else
-	  request = Request.new client
-	  self.request_handler client, request
-	end
-      rescue
+          #we grab the 1st two bytes to see if they contain the magic number
+          #for SSL ClientHello, and create an SSL socket accordingly
+          if @invisible
+            bytes = client.recv(2, Socket::MSG_PEEK)  
+            if $CLIENT_HELLOS.include? bytes
+              $LOG.debug("First bytes #{bytes}, SSL ClientHello")
+              dummy, port, host = client.getsockopt(Socket::SOL_IP, $SO_ORIGINAL_DST).unpack("nnN")
+              cert = self.get_cert(host, port)
+              ctx = @ssl_contexts[cert.subject]
+              ssl_client = OpenSSL::SSL::SSLSocket.new(client,ctx)
+              ssl_client.accept
+              request = Request.new ssl_client, true
+              self.request_handler_ssl ssl_client, request
+            else
+              $LOG.debug("First bytes #{bytes}, HTTP")
+              request = Request.new client
+              self.request_handler client, request
+            end
+          else
+            request = Request.new client
+            self.request_handler client, request
+          end
+        rescue
           $LOG.error($!)
         end
       } 
@@ -184,7 +183,7 @@ puts "INVVV"
     end
     self.create_pipe ssl_client, server, request
   end
-    
+  
   def create_pipe(client, server, initial_request)
     if initial_request
       server.write initial_request.contents
