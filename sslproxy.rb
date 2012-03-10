@@ -1,3 +1,5 @@
+#!/usr/bin/env ruby
+
 require 'socket'
 require 'openssl'
 require 'logger'
@@ -8,7 +10,7 @@ $CLIENT_HELLOS = ["\x16\x03", #First 2 bytes of ClientHellos this should (?) cov
                   "\x80\x9e"]
 $SO_ORIGINAL_DST = 80 #not defined in socket module
 class Request # grabs an HTTP request from the socket
-  # this should probably be WEBrick::HTTPRequest
+  # TODO this should probably be WEBrick::HTTPRequest
   attr_accessor :contents, :method, :host, :port
   def initialize(client, ssl=false)
     @contents = ""
@@ -17,8 +19,8 @@ class Request # grabs an HTTP request from the socket
     end
     @contents << l
     lines = @contents.split("\n")
-    @method, addr, protocol = lines [0].split
-    if self.is_connect? #addr is host:port
+    @method, addr, protocol = lines[0].split
+    if self.connect_method? #addr is host:port
       @host, @port = addr.split ':'
       if @port.nil?
         @port = 443
@@ -27,12 +29,11 @@ class Request # grabs an HTTP request from the socket
       end
     else #addr is a uri
       uri = URI(addr)
-      puts uri
       @host = uri.host || lines[1].split[1]
-      @port = uri.port || ssl ? 443 : 80
+      @port = uri.port || (ssl ? 443 : 80)
     end
   end
-  def is_connect?
+  def connect_method?
     @method == "CONNECT"
   end
 end
@@ -43,10 +44,8 @@ class SSLProxy
     @host = host
     @port = port
     @invisible = opt[:invisible] || false
-    puts @invisible
     @upstream_host = opt[:upstream_host] || nil
     @upstream_port = opt[:upstream_port] || nil
-    puts @upstream_host
     # use this to cache forged ssl certs (SSLContexts)
     @ssl_contexts = Hash.new { |ssl_contexts, subject|
       #we use a previously generated root ca
@@ -76,7 +75,6 @@ class SSLProxy
       ctx.ca_file="root.pem"
       ssl_contexts[subject] = ctx
     }
-    puts @host, @port
     @proxy = TCPServer.new(@host, @port)
   end
 
@@ -92,9 +90,9 @@ class SSLProxy
       client = @proxy.accept
       Thread.new(client) { |client|
 	begin
-          #we grab the 1st two bytes to see if they contain the magic number
-          #for SSL ClientHello, and create an SSL socket accordingly
           if @invisible
+            #we grab the 1st two bytes to see if they contain the magic number
+            #for SSL ClientHello, and create an SSL socket accordingly
             bytes = client.recv(2, Socket::MSG_PEEK)  
             if $CLIENT_HELLOS.include? bytes
               $LOG.debug("First bytes #{bytes}, SSL ClientHello")
@@ -124,11 +122,9 @@ class SSLProxy
   def connect_ssl(host, port, initial = nil)
     socket = TCPSocket.new(host,port)
     if initial
-      puts initial
       socket.write initial << "\r\n"
       #TODO: interpret this and error out here if its not 200?
-      dummy = socket.readpartial(4096)
-      puts dummy
+      dummy = (socket.readpartial(4096)) rescue nil
     end
     ssl = OpenSSL::SSL::SSLSocket.new(socket)
     ssl.sync_close = true
@@ -141,10 +137,10 @@ class SSLProxy
   end
   
   def request_handler(client, request)
-    #if his is the visible proxy mode, the client will send us an
+    #if this is the visible proxy mode, the client will send us an
     #unencrypted CONNECT request before we begin the SSL handshake
     #we ascertain the host/port from there
-    if request.is_connect?
+    if request.connect_method?
       #connect to the server and forge the correct cert (using the same
       #subject as the server we connected to)
       if self.upstream_proxy?
@@ -166,8 +162,8 @@ class SSLProxy
         server = TCPSocket.new(@upstream_host, @upstream_port)
       else
         server = TCPSocket.new(request.host, request.port)
-        server.write request.contents
-        server.write "\r\n"
+        #server.write request.contents
+        #server.write "\r\n"
       end
       #we pass along the request we cached
       self.create_pipe client, server, request
@@ -178,7 +174,6 @@ class SSLProxy
     if self.upstream_proxy?
       server = self.connect_ssl @upstream_host, @upstream_port, "CONNECT #{request.host}:#{request.port} HTTP/1.1\r\n"
     else
-      puts request.host, request.port
       server = self.connect_ssl request.host, request.port
     end
     self.create_pipe ssl_client, server, request
@@ -187,6 +182,8 @@ class SSLProxy
   def create_pipe(client, server, initial_request)
     if initial_request
       server.write initial_request.contents
+     # server.write "\r\n"
+      server.flush
       $LOG.info("#{Thread.current}: client->server (initial) #{initial_request.inspect}")
     end
     while true
@@ -214,15 +211,12 @@ class SSLProxy
             server.flush
           else
             # Read from server, write to client.
-            data = socket.readpartial(4096)
+            (data = socket.readpartial(4096)) rescue nil
             $LOG.info("#{Thread.current}: server->client #{data.inspect}")
             client.write data
             client.flush
           end
         end
-      rescue EOFError
-        $LOG.debug($!)
-        break
       rescue IOError
         $LOG.debug($!)
         break
@@ -242,7 +236,7 @@ $LOG.sev_threshold = Logger::ERROR
 
 options = {}
 host = "localhost"
-port = 8008
+port = 8080
 OptionParser.new do |opts|
   opts.banner = "Usage: example.rb [options]"
   opts.on("-l", "--listen HOST:PORT", "Host and port to listen on") do |address|
@@ -270,6 +264,7 @@ OptionParser.new do |opts|
     $LOG.sev_threshold = Logger::DEBUG
   end
 end.parse!
+
 puts options
 s = SSLProxy.new(host, port, options)
 s.start
