@@ -8,7 +8,12 @@ require 'uri'
 
 $CLIENT_HELLOS = ["\x16\x03", #First 2 bytes of ClientHellos this should (?) cover common SSL/TLS version
                   "\x80\x9e"]
-$SO_ORIGINAL_DST = 80 #not defined in socket module
+#For some reason, ruby doesn't define this constant
+if not Socket.const_defined? 'SO_ORIGINAL_DST'
+  Socket.const_set 'SO_ORIGINAL_DST', 80
+end
+
+  #not defined in socket module
 class Request # grabs an HTTP request from the socket
   # TODO this should probably be WEBrick::HTTPRequest
   attr_accessor :contents, :method, :host, :port
@@ -96,7 +101,7 @@ class SSLProxy
             bytes = client.recv(2, Socket::MSG_PEEK)  
             if $CLIENT_HELLOS.include? bytes
               $LOG.debug("First bytes #{bytes}, SSL ClientHello")
-              dummy, port, host = client.getsockopt(Socket::SOL_IP, $SO_ORIGINAL_DST).unpack("nnN")
+              dummy, port, host = client.getsockopt(Socket::SOL_IP, Socket::SO_ORIGINAL_DST).unpack("nnN")
               cert = self.get_cert(host, port)
               ctx = @ssl_contexts[cert.subject]
               ssl_client = OpenSSL::SSL::SSLSocket.new(client,ctx)
