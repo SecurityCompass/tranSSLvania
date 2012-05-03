@@ -13,7 +13,6 @@ if not Socket.const_defined? 'SO_ORIGINAL_DST'
   Socket.const_set 'SO_ORIGINAL_DST', 80
 end
 
-  #not defined in socket module
 class Request # grabs an HTTP request from the socket
   # TODO this should probably be WEBrick::HTTPRequest
   attr_accessor :contents, :method, :host, :port
